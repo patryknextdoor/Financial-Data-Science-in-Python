@@ -73,9 +73,12 @@ try:
         for package in 'yfinance','arch':
             nprint("Installing %s into Google notebook..." % package)
             ip.system("pip install %s 1>/dev/null" % package)
+            
+        from tqdm.notebook import tqdm
 
 except ModuleNotFoundError:
-    pass # if IPython not installed, we're definitely not in a notebook
+    # if IPython not installed, we're definitely not in a notebook
+    from tqdm import tqdm
 
 from warnings import filterwarnings
 filterwarnings("ignore",category=RuntimeWarning) # I don't care
@@ -89,7 +92,7 @@ import numpy as np
 import matplotlib.pyplot as pl ; plt=pl
 
 # some friendly numbers
-zero,one,two,three,four,five,ten,hundred,thousand=0e0,1e0,2e0,3e0,4e0,5e0,1e1,1e2,1e3
+zero,one,two,three,four,five,ten,hundred,annualize,thousand=0e0,1e0,2e0,3e0,4e0,5e0,1e1,1e2,252e0,1e3
 half,GoldenRatio=one/two,(one+np.sqrt(five))/two
 
 # import arch classes
@@ -162,6 +165,91 @@ class CountLabels(DirectionalLabels):
         self.minus=self.plus
         self.zero=str(zero)
         self.scale=abs(scale)
+
+# loads index membership from Wikipedia
+def loadindex(indexname):
+    """Load the specified index and return the members and the first date for data extraction."""
+
+    if indexname=='S&P 500':
+        display(index:=pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0].rename(columns={"Symbol":"Ticker"}).set_index("Ticker"))
+        first_date=index['Date added'].max() # add data is in table returned
+
+    elif indexname=='NASDAQ-100':
+        display(index:=pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4].rename(columns={"Symbol":"Ticker"}).set_index("Ticker"))
+        first_date=datetime.now().strftime("%Y-01-02") # NASDAQ rebalances (normally) on the first day of the year. Jan'1st. is *always* a holiday
+
+    elif indexname=='S&P MidCap 400':
+        display(index:=pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')[0].rename(columns={"Symbol":"Ticker"}).set_index("Ticker"))
+        updates=pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_400_companies')[1].set_index(("Date","Date"))
+        updates.index=list(map(lambda x:pd.Period(x.split('[')[0],'D'),updates.index))
+        first_date=str(updates.index.max())
+
+    elif indexname=='S&P SmallCap 600':
+        display(index:=pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')[0].rename(columns={"Symbol":"Ticker"}).set_index("Ticker"))
+        updates=pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_600_companies')[1].set_index(("Date","Date"))
+        updates.index=list(map(lambda x:pd.Period(x.split('[')[0],'D'),updates.index))
+        first_date=str(updates.index.max())
+
+    elif indexname=='S&P 900': # union of S&P 500 and S&P MidCap 400
+        sp500,dt500=loadindex('S&P 500')
+        sp400,dt400=loadindex('S&P MidCap 400')
+        columns=list(set(sp500.columns).intersection(set(sp400.columns)))
+        index=pd.concat([sp500[columns],sp400[columns]]).sort_index()
+        first_date=max([dt500,dt400])
+
+    elif indexname=='S&P 1500': # union of S&P 500, S&P MidCap 400, and S&P SmallCap 600
+        sp900,dt900=loadindex('S&P 900')
+        sp600,dt600=loadindex('S&P SmallCap 600')
+        columns=list(set(sp900.columns).intersection(set(sp600.columns)))
+        index=pd.concat([sp900[columns],sp600[columns]]).sort_index()
+        first_date=max([dt900,dt600])
+
+    elif indexname=='Dow': # Dow Jones
+        display(index:=pd.read_html('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average')[1].rename(columns={"Symbol":"Ticker"}).set_index("Ticker"))
+        first_date=index['Date added'].max()
+
+    elif indexname=='FTSE 250':
+        index=pd.read_html('https://en.wikipedia.org/wiki/FTSE_250_Index')[3]
+        index["Ticker"]=index["Ticker"].apply(lambda x:x+".L") # set to Reuter's style tickers
+        index.set_index("Ticker",inplace=True)
+        display(index)
+        first_date=((pd.Period(datetime.now(),'Q')-1).asfreq('B')+1).strftime("%Y-%m-%d") # first date of current quarter
+        
+    else:
+        raise ValueError("Don't know how to load members of %s Index!" % indexname)
+
+    return index[~index.index.duplicated()],first_date # drop duplicates in case some exist
+
+# download data from FRED
+from requests import get
+from os import environ
+from getpass import getpass
+
+def get_fred(series_id,FRED_API_KEY=None):
+    """Function to get data from FRED API and return it as a DataFrame, also returns metadata object."""
+    
+    if FRED_API_KEY is not None:
+        environ['FRED_API_KEY']=FRED_API_KEY
+
+    elif 'FRED_API_KEY' not in environ:
+        environ['FRED_API_KEY']=getpass("You need to enter a FRED API key (your keys are stored here: https://fredaccount.stlouisfed.org/apikeys): ")
+
+    response=get((url:="https://api.stlouisfed.org/fred/series/observations?series_id={}&api_key={}&file_type=json").format(series_id,environ['FRED_API_KEY']))
+
+    if response.status_code//100!=2:
+        raise ValueError("Get status_code={:d} from {:s}".format(response.status_code,url))
+
+    df=pd.DataFrame.from_dict(pd.json_normalize(response.json())['observations'][0])[['date','value']].rename(columns={"date":"Date","value":series_id}).set_index("Date")
+    df[series_id]=df[series_id].apply(lambda x:float(x) if x!='.' else np.nan)
+
+    response=get((url:="https://api.stlouisfed.org/fred/series?series_id={}&api_key={}&file_type=json").format(series_id,environ['FRED_API_KEY']))
+
+    if response.status_code//100!=2:
+        raise ValueError("Get status_code={:d} from {:s}".format(response.status_code,url))
+
+    metadata=response.json()['seriess'][0]
+    df.index=pd.DatetimeIndex(df.index).to_period(metadata['frequency_short'])
+    return df.dropna(),metadata
 
 # that's all folks
 nprint("Initialized.")
